@@ -1,9 +1,12 @@
 import UIKit
+import Darwin
+import MLX
 import MLXLLM
 import MLXLMCommon
 import MLXHuggingFace
 import HuggingFace
 import Tokenizers
+
 
 class ViewController: UIViewController {
 
@@ -68,7 +71,12 @@ class ViewController: UIViewController {
     private var loadTask: Task<Void, Never>?
     private var downloadTask: Task<Void, Never>?
     private var generateTask: Task<Void, Never>?
+    private var compareTask: Task<Void, Never>?
+    private var isComparing = false
+    private var isGenerating = false
+    private var isBusy: Bool { isGenerating || isComparing }
     private var accumulatedText = ""
+    private var lastProgressUpdate = Date.distantPast
 
     private let systemPrompt = "당신은 친절한 AI 어시스턴트입니다. 모든 답변은 반드시 한국어로 작성해 주세요."
 
@@ -185,6 +193,18 @@ class ViewController: UIViewController {
         return stack
     }()
 
+    private lazy var statsLabel: UILabel = {
+        let lbl = UILabel()
+        lbl.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        lbl.textColor = .secondaryLabel
+        lbl.textAlignment = .center
+        lbl.adjustsFontSizeToFitWidth = true
+        lbl.minimumScaleFactor = 0.7
+        return lbl
+    }()
+
+    private var statsTimer: Timer?
+
     private lazy var progressView: UIProgressView = {
         let pv = UIProgressView(progressViewStyle: .default)
         pv.isHidden = true
@@ -207,6 +227,8 @@ class ViewController: UIViewController {
         tf.borderStyle = .roundedRect
         tf.returnKeyType = .send
         tf.delegate = self
+        // 텍스트가 길어져도 버튼을 밀어내지 않도록 압축 허용
+        tf.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         return tf
     }()
 
@@ -217,6 +239,8 @@ class ViewController: UIViewController {
         btn.addTarget(self, action: #selector(sendTapped), for: .touchUpInside)
         btn.isEnabled = false
         btn.setContentHuggingPriority(.required, for: .horizontal)
+        // 텍스트가 긴 inputField에 밀려 축소되지 않도록 강제 고정
+        btn.setContentCompressionResistancePriority(.required, for: .horizontal)
         btn.configurationUpdateHandler = { b in b.alpha = b.isEnabled ? 1 : 0.4 }
         return btn
     }()
@@ -241,10 +265,20 @@ class ViewController: UIViewController {
         view.backgroundColor = .systemBackground
         setupLayout()
         updateUI()
+        startStatsTimer()
         if #available(iOS 26, *) {
             applyGlassEffect(to: sendButton)
             applyGlassEffect(to: pickerDoneButton)
         }
+        let longPress = UILongPressGestureRecognizer(target: self, action: #selector(sendLongPressed(_:)))
+        longPress.minimumPressDuration = 0.8
+        sendButton.addGestureRecognizer(longPress)
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        statsTimer?.invalidate()
+        statsTimer = nil
     }
 
     // MARK: - Layout
@@ -261,6 +295,7 @@ class ViewController: UIViewController {
             thinkingRow,
             progressView,
             statusLabel,
+            statsLabel,
             inputRow,
             outputTextView,
         ])
@@ -315,7 +350,13 @@ class ViewController: UIViewController {
         if loadedModelIndex == index   { return "⚡" }
         if loadingIndex == index       { return "🔄" }
         if downloadingIndex == index   { return "⬇️" }
-        if isDownloaded(models[index].config) { return "📥" }
+        if isDownloaded(models[index].config) {
+            switch memoryCompatibility(for: index).badge {
+            case "❌": return "❌"
+            case "⚠️": return "⚠️"
+            default:   return "📥"
+            }
+        }
         return "☁️"
     }
 
@@ -324,6 +365,15 @@ class ViewController: UIViewController {
         var title: String
         var color: UIColor = .tintColor
         var enabled = true
+
+        if isBusy {
+            var cfg = loadButton.configuration ?? .filled()
+            cfg.title = "로드"
+            cfg.baseBackgroundColor = .systemGray
+            loadButton.configuration = cfg
+            loadButton.isEnabled = false
+            return
+        }
 
         if loadedModelIndex == idx {
             title = "언로드"
@@ -337,7 +387,12 @@ class ViewController: UIViewController {
             color = .systemOrange
         } else if isDownloaded(models[idx].config) {
             // Cached model: can always load, even while another is downloading.
-            title = "로드"
+            let compat = memoryCompatibility(for: idx)
+            switch compat.badge {
+            case "❌": title = "로드 ❌"; color = .systemRed
+            case "⚠️": title = "로드 ⚠️"; color = .systemOrange
+            default:   title = "로드"
+            }
             enabled = loadingIndex == nil
         } else if downloadingIndex != nil {
             // Another download is running — block new downloads.
@@ -358,7 +413,7 @@ class ViewController: UIViewController {
 
     private func updateDeleteButton() {
         let idx = selectedIndex
-        deleteButton.isEnabled = isDownloaded(models[idx].config) || loadedModelIndex == idx
+        deleteButton.isEnabled = !isBusy && (isDownloaded(models[idx].config) || loadedModelIndex == idx)
     }
 
     private func updateThinkToggle() {
@@ -366,13 +421,71 @@ class ViewController: UIViewController {
         if info.supportsThinking {
             thinkLabel.text = "Think 모드"
             thinkLabel.textColor = .label
-            thinkSwitch.isEnabled = true
+            thinkSwitch.isEnabled = !isBusy
         } else {
             thinkLabel.text = "Think 모드  (미지원)"
             thinkLabel.textColor = .tertiaryLabel
             thinkSwitch.isEnabled = false
             thinkSwitch.isOn = false
             isThinkingEnabled = false
+        }
+    }
+
+    // MARK: - Generation Error Handling
+
+    private func showTimeoutAlert(retryPrompt: String, stage: String = "생성") {
+        let modelName = loadedModelIndex.map { models[$0].label } ?? "모델"
+        let alert = UIAlertController(
+            title: "⏱ 응답 타임아웃 (\(stage) 단계)",
+            message: "\(modelName)이 3초 내 응답하지 못했습니다.\n대형 모델은 첫 토큰까지 시간이 걸릴 수 있습니다.\n언로드 후 재로드하거나 더 작은 모델을 시도해 보세요.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "재시도", style: .default) { [weak self] _ in
+            self?.generate(prompt: retryPrompt)
+        })
+        alert.addAction(UIAlertAction(title: "언로드", style: .destructive) { [weak self] _ in
+            self?.unloadModel()
+        })
+        alert.addAction(UIAlertAction(title: "닫기", style: .cancel))
+        present(alert, animated: true)
+        statusLabel.text = "⏱ 타임아웃 — 재시도하거나 모델을 언로드해 주세요"
+    }
+
+    // MARK: - Toast
+
+    private func showToast(_ message: String) {
+        let container = UIView()
+        container.backgroundColor = UIColor.black.withAlphaComponent(0.75)
+        container.layer.cornerRadius = 10
+        container.clipsToBounds = true
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        let label = UILabel()
+        label.text = message
+        label.font = .systemFont(ofSize: 13)
+        label.textColor = .white
+        label.textAlignment = .center
+        label.numberOfLines = 0
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        container.addSubview(label)
+        view.addSubview(container)
+
+        NSLayoutConstraint.activate([
+            label.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
+            label.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -8),
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
+            label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
+            container.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            container.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -24),
+            container.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 32),
+            container.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -32),
+        ])
+
+        UIView.animate(withDuration: 0.3, delay: 2.0, options: []) {
+            container.alpha = 0
+        } completion: { _ in
+            container.removeFromSuperview()
         }
     }
 
@@ -385,6 +498,9 @@ class ViewController: UIViewController {
     @objc private func pickerDone() {
         modelPickerField.resignFirstResponder()
         updateUI()
+        if let loadedIdx = loadedModelIndex, loadedIdx != selectedIndex {
+            showToast("⚡ \(models[loadedIdx].label) 로드됨 · 전송 시 이 모델로 실행됩니다")
+        }
     }
 
     private func isDownloaded(_ config: ModelConfiguration) -> Bool {
@@ -450,9 +566,57 @@ class ViewController: UIViewController {
     // MARK: - Load from Cache
 
     private func loadFromCache(at index: Int) {
+        let neededGB   = estimatedRAMGB(for: index)
+        let willFreeGB = loadedModelIndex.map { estimatedRAMGB(for: $0) } ?? 0
+        let physGB     = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        // 실측 Jetsam 한도: iPhone Air 8GB → 3376MB(41.2%). 0.40을 보수적 상한으로 사용
+        let limitGB    = physGB * 0.40
+
+        // 정적 한도 초과 → 기기에서 이 모델은 절대 로드 불가
+        if neededGB > limitGB {
+            let alert = UIAlertController(
+                title: "❌ 이 기기에서 로드 불가",
+                message: String(
+                    format: "필요 RAM: 약 %.1fGB\n기기 RAM %.1fGB · iOS 앱 한도 약 %.1fGB\n\n이 모델은 이 기기의 iOS 메모리 한도를 초과합니다.",
+                    neededGB, physGB, limitGB
+                ),
+                preferredStyle: .alert
+            )
+            alert.addAction(UIAlertAction(title: "확인", style: .cancel))
+            present(alert, animated: true)
+            return
+        }
+
+        // 동적 체크: OS가 직접 알려주는 실제 남은 헤드룸 (Jetsam 까지 쓸 수 있는 바이트)
+        let headroomGB  = availableAppMemoryGB()
+        let effectiveGB = headroomGB + willFreeGB
+
+        if neededGB <= effectiveGB {
+            performLoadFromCache(at: index)
+            return
+        }
+
+        // 한도 이내지만 현재 헤드룸 부족 → 경고 후 선택
+        let alert = UIAlertController(
+            title: "⚠️ 메모리 부족 경고",
+            message: String(
+                format: "필요 RAM: 약 %.1fGB\n현재 가용 (기존 모델 해제 후): %.1fGB\n\n기기 RAM %.1fGB · iOS 앱 한도 약 %.1fGB",
+                neededGB, effectiveGB, physGB, limitGB
+            ),
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "위험 감수하고 로드", style: .destructive) { [weak self] _ in
+            self?.performLoadFromCache(at: index)
+        })
+        alert.addAction(UIAlertAction(title: "취소", style: .cancel))
+        present(alert, animated: true)
+    }
+
+    private func performLoadFromCache(at index: Int) {
         // Release previous model to free RAM before loading the new one
         if modelContainer != nil {
             modelContainer = nil
+            Memory.clearCache()  // Metal 버퍼 즉시 반환
             loadedModelIndex = nil
             sendButton.isEnabled = false
         }
@@ -485,6 +649,137 @@ class ViewController: UIViewController {
         }
     }
 
+    // MARK: - System Stats
+
+    // MARK: - Memory Estimation
+
+    private func estimatedRAMGB(for index: Int) -> Double {
+        var s = models[index].size.trimmingCharacters(in: .whitespaces)
+        if s.hasPrefix("~") { s = String(s.dropFirst()) }
+        let upper = s.uppercased()
+        let numericStr = s.prefix(while: { $0.isNumber || $0 == "." })
+        guard let value = Double(numericStr) else { return 4.0 }
+        let rawGB = upper.contains("MB") ? value / 1024.0 : value
+        return rawGB * 1.5   // ~50% overhead: KV cache + Metal buffers + tokenizer parsing (Gemma 256K vocab, etc.)
+    }
+
+    private func memoryCompatibility(for index: Int) -> (badge: String, label: String, color: UIColor) {
+        let physGB   = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        // 실측: iPhone Air 8GB → Jetsam limit 3376MB = 41.2%. 0.40을 보수적 상한으로 사용
+        let limitGB  = physGB * 0.40
+        let neededGB = estimatedRAMGB(for: index)
+        if neededGB > limitGB        { return ("❌", "불가", .systemRed) }
+        if neededGB > limitGB * 0.85 { return ("⚠️", "주의", .systemOrange) }
+        return ("✅", "적합", .systemGreen)
+    }
+
+    private func availableAppMemoryGB() -> Double {
+        // os_proc_available_memory()는 현재 프로세스가 Jetsam 전까지 사용 가능한 실제 바이트를 반환
+        let bytes = os_proc_available_memory()
+        return bytes > 0 ? Double(bytes) / 1_073_741_824 : 0
+    }
+
+    private func startStatsTimer() {
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        updateStats()
+        statsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.updateStats()
+        }
+    }
+
+    private func updateStats() {
+        let ramStr = appRAMString()
+        let diskStr = systemFreeDiskString()
+        let thermalIcon = thermalStateIcon()
+        let batteryStr = batteryString()
+        statsLabel.text = "RAM \(ramStr)  ·  여유 \(diskStr)  ·  발열\(thermalIcon)  ·  \(batteryStr)"
+    }
+
+    private func physFootprintGB() -> Double {
+        // task_vm_info_data_t is the correct struct for phys_footprint
+        // (mach_task_basic_info does NOT have this field)
+        var vmInfo = task_vm_info_data_t()
+        var count  = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let result: kern_return_t = withUnsafeMutablePointer(to: &vmInfo) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+        return Double(vmInfo.phys_footprint) / 1_073_741_824
+    }
+
+    private func appRAMString() -> String {
+        let gb = physFootprintGB()
+        guard gb > 0 else { return "—" }
+        let mb = gb * 1024
+        return mb >= 1024 ? String(format: "%.1fGB", gb) : String(format: "%.0fMB", mb)
+    }
+
+    private func systemFreeDiskBytes() -> Int64 {
+        guard let attrs = try? FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory()),
+              let free = attrs[.systemFreeSize] as? Int64 else { return 0 }
+        return free
+    }
+
+    private func systemFreeDiskString() -> String {
+        let bytes = systemFreeDiskBytes()
+        return bytes > 0 ? ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file) : "—"
+    }
+
+    private func thermalStateIcon() -> String {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal:    return "🟢"
+        case .fair:       return "🟡"
+        case .serious:    return "🟠"
+        case .critical:   return "🔴"
+        @unknown default: return "❓"
+        }
+    }
+
+    private func batteryString() -> String {
+        let level = UIDevice.current.batteryLevel
+        guard level >= 0 else { return "🔋—" }
+        let pct = Int(level * 100)
+        let icon = UIDevice.current.batteryState == .charging ? "⚡" : "🔋"
+        return "\(icon)\(pct)%"
+    }
+
+    // MARK: - Download Verification
+
+    private func verifyDownloadedFiles(at index: Int) -> (ok: Bool, detail: String) {
+        let config = models[index].config
+        guard case .id(let idString, _) = config.id,
+              let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            return (false, "캐시 디렉터리 접근 실패")
+        }
+        let dirName = "models--" + idString.replacingOccurrences(of: "/", with: "--")
+        let modelDir = cachesDir.appendingPathComponent("huggingface/hub").appendingPathComponent(dirName)
+
+        guard FileManager.default.fileExists(atPath: modelDir.path) else {
+            return (false, "모델 디렉터리 없음")
+        }
+
+        let snapshotsDir = modelDir.appendingPathComponent("snapshots")
+        guard let snapshots = try? FileManager.default.contentsOfDirectory(atPath: snapshotsDir.path),
+              let snapshot = snapshots.first else {
+            return (false, "스냅샷 없음 — 다운로드가 중단됐을 수 있습니다")
+        }
+
+        let snapshotDir = snapshotsDir.appendingPathComponent(snapshot)
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: snapshotDir.path) else {
+            return (false, "파일 목록 읽기 실패")
+        }
+
+        let hasConfig  = files.contains("config.json")
+        let hasWeights = files.contains { $0.hasSuffix(".safetensors") || $0.hasSuffix(".npz") || $0.hasSuffix(".gguf") }
+
+        if !hasConfig  { return (false, "config.json 없음") }
+        if !hasWeights { return (false, "가중치 파일(.safetensors) 없음 — 재다운로드 필요") }
+
+        return (true, "\(files.count)개 파일")
+    }
+
     // MARK: - Background Download
 
     private func startDownload(at index: Int) {
@@ -492,6 +787,7 @@ class ViewController: UIViewController {
               let repoID = Repo.ID(rawValue: idString) else { return }
 
         downloadingIndex = index
+        lastProgressUpdate = .distantPast
         progressView.isHidden = false
         progressView.progress = 0
         statusLabel.text = "⬇️ \(models[index].label) 다운로드 중..."
@@ -507,9 +803,14 @@ class ViewController: UIViewController {
                     revision: revision,
                     progressHandler: { @MainActor [weak self] progress in
                         guard let self, self.downloadingIndex == index else { return }
+                        let now = Date()
+                        guard now.timeIntervalSince(self.lastProgressUpdate) >= 1.0 else { return }
+                        self.lastProgressUpdate = now
                         let pct = Float(progress.fractionCompleted)
                         self.progressView.progress = pct
-                        self.statusLabel.text = String(format: "⬇️ %@ %.0f%%", self.models[index].label, pct * 100)
+                        let done = ByteCountFormatter.string(fromByteCount: progress.completedUnitCount, countStyle: .file)
+                        let total = ByteCountFormatter.string(fromByteCount: progress.totalUnitCount, countStyle: .file)
+                        self.statusLabel.text = String(format: "⬇️ %@  %@ / %@  (%.0f%%)", self.models[index].label, done, total, pct * 100)
                     }
                 )
 
@@ -524,12 +825,20 @@ class ViewController: UIViewController {
                 self.downloadTask = nil
                 self.progressView.isHidden = true
 
+                // Verify downloaded files before proceeding
+                let (ok, detail) = self.verifyDownloadedFiles(at: index)
+                guard ok else {
+                    self.statusLabel.text = "❌ 검증 실패: \(detail)\n다시 다운로드해 주세요."
+                    self.updateUI()
+                    return
+                }
+
                 // Auto-load if no model is active; otherwise just notify
                 if self.loadedModelIndex == nil {
                     self.loadFromCache(at: index)
                 } else {
                     self.updateUI()
-                    self.statusLabel.text = "✅ \(self.models[index].label) 다운로드 완료. '로드'를 눌러 전환하세요."
+                    self.statusLabel.text = "✅ \(self.models[index].label) 다운로드 완료 (\(detail)). '로드'를 눌러 전환하세요."
                 }
             } catch {
                 if !Task.isCancelled {
@@ -548,11 +857,141 @@ class ViewController: UIViewController {
         generateTask?.cancel()
         generateTask = nil
         modelContainer = nil
+        Memory.clearCache()  // Metal 버퍼 즉시 반환
         loadedModelIndex = nil
         sendButton.isEnabled = false
         accumulatedText = ""
         statusLabel.text = "모델 언로드됨"
         updateUI()
+    }
+
+    // MARK: - Comparison
+
+    @objc private func sendLongPressed(_ gesture: UILongPressGestureRecognizer) {
+        guard gesture.state == .began, !isComparing else { return }
+        guard let prompt = inputField.text?.trimmingCharacters(in: .whitespacesAndNewlines), !prompt.isEmpty else {
+            showToast("먼저 질문을 입력하세요")
+            return
+        }
+        let downloadedIndices = models.indices.filter { isDownloaded(models[$0].config) }
+        guard downloadedIndices.count >= 2 else {
+            showToast("비교하려면 다운로드된 모델이 2개 이상 필요합니다")
+            return
+        }
+        inputField.resignFirstResponder()
+
+        let selectionVC = ComparisonModelSelectionVC(
+            modelLabels: models.map { $0.label },
+            downloadedIndices: downloadedIndices
+        ) { [weak self] selectedIndices in
+            self?.startComparison(prompt: prompt, modelIndices: selectedIndices)
+        }
+        let nav = UINavigationController(rootViewController: selectionVC)
+        nav.modalPresentationStyle = .pageSheet
+        if let sheet = nav.sheetPresentationController {
+            sheet.detents = [.medium(), .large()]
+            sheet.prefersGrabberVisible = true
+        }
+        present(nav, animated: true)
+    }
+
+    private func startComparison(prompt: String, modelIndices: [Int]) {
+        let physGB  = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        let limitGB = physGB * 0.40
+        let loadableIndices = modelIndices.filter { estimatedRAMGB(for: $0) <= limitGB }
+
+        guard !loadableIndices.isEmpty else {
+            showToast("선택한 모델이 모두 이 기기 메모리 한도를 초과합니다")
+            return
+        }
+        if loadableIndices.count < modelIndices.count {
+            let skipped = modelIndices.count - loadableIndices.count
+            showToast("메모리 한도 초과 \(skipped)개 모델 제외됩니다")
+        }
+
+        // 기존 모델 언로드 (RAM 확보)
+        generateTask?.cancel()
+        generateTask = nil
+        modelContainer = nil
+        loadedModelIndex = nil
+
+        isComparing = true
+        sendButton.isEnabled = false
+        inputField.isEnabled = false
+        updateUI()
+
+        let total = loadableIndices.count
+        var results: [(label: String, text: String, tps: Double)] = []
+
+        compareTask = Task {
+            for (i, idx) in loadableIndices.enumerated() {
+                if Task.isCancelled { break }
+                let label = models[idx].label
+                let step = "\(i + 1)/\(total)"
+
+                self.statusLabel.text = "🔄 비교 \(step) · \(label) 로드 중..."
+
+                do {
+                    var container: ModelContainer? = try await LLMModelFactory.shared.loadContainer(
+                        from: #hubDownloader(),
+                        using: #huggingFaceTokenizerLoader(),
+                        configuration: models[idx].config,
+                        progressHandler: { _ in }
+                    )
+                    guard !Task.isCancelled, let c = container else { container = nil; break }
+
+                    self.statusLabel.text = "⏳ 비교 \(step) · \(label) 생성 중..."
+
+                    let additionalContext: [String: any Sendable]? = self.isThinkingEnabled ? nil : ["enable_thinking": false]
+                    let userInput = UserInput(
+                        chat: [.system(self.systemPrompt), .user(prompt)],
+                        additionalContext: additionalContext
+                    )
+                    let lmInput = try await c.prepare(input: userInput)
+                    let stream = try await c.generate(
+                        input: lmInput,
+                        parameters: GenerateParameters(maxTokens: min(self.models[idx].maxTokens, 1024), temperature: 0.7)
+                    )
+
+                    var text = ""
+                    var tps = 0.0
+                    for await event in stream {
+                        if Task.isCancelled { break }
+                        switch event {
+                        case .chunk(let chunk): text += chunk
+                        case .info(let info):   tps = info.tokensPerSecond
+                        default: break
+                        }
+                    }
+                    results.append((label: label, text: text, tps: tps))
+                    container = nil          // Swift 참조 해제
+                    Memory.clearCache()      // MLX Metal 버퍼 캐시를 OS에 반환
+
+                } catch {
+                    results.append((label: label, text: "오류: \(error.localizedDescription)", tps: 0))
+                    Memory.clearCache()
+                }
+            }
+
+            self.isComparing = false
+            self.inputField.isEnabled = true
+            self.sendButton.isEnabled = self.modelContainer != nil
+            self.updateUI()
+
+            guard !results.isEmpty, !Task.isCancelled else {
+                self.statusLabel.text = "비교 취소됨"
+                return
+            }
+
+            self.statusLabel.text = "✅ 비교 완료 — \(results.count)/\(total)개 모델"
+            let renderer: (String) -> NSAttributedString = { [weak self] text in
+                self?.renderOutput(text) ?? NSAttributedString(string: text)
+            }
+            let vc = ComparisonResultsVC(prompt: prompt, results: results, renderer: renderer)
+            let nav = UINavigationController(rootViewController: vc)
+            nav.modalPresentationStyle = .fullScreen
+            self.present(nav, animated: true)
+        }
     }
 
     // MARK: - Delete
@@ -606,22 +1045,46 @@ class ViewController: UIViewController {
             progressView.isHidden = true
         }
 
+        let freeBefore = systemFreeDiskBytes()
         let config = models[index].config
         switch config.id {
         case .directory:
             break
         case .id(let idString, _):
-            if let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
-                let dirName = "models--" + idString.replacingOccurrences(of: "/", with: "--")
-                let modelDir = cachesDir
-                    .appendingPathComponent("huggingface/hub")
-                    .appendingPathComponent(dirName)
-                try? FileManager.default.removeItem(at: modelDir)
+            guard let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+                statusLabel.text = "❌ 캐시 디렉터리 접근 실패"
+                updateUI()
+                return
+            }
+            let dirName = "models--" + idString.replacingOccurrences(of: "/", with: "--")
+            let modelDir = cachesDir
+                .appendingPathComponent("huggingface/hub")
+                .appendingPathComponent(dirName)
+            guard FileManager.default.fileExists(atPath: modelDir.path) else {
+                statusLabel.text = "⚠️ 캐시 없음 (이미 삭제됨?)\n경로: \(modelDir.lastPathComponent)"
+                updateUI()
+                return
+            }
+            do {
+                try FileManager.default.removeItem(at: modelDir)
+            } catch {
+                statusLabel.text = "❌ 삭제 실패: \(error.localizedDescription)"
+                updateUI()
+                return
             }
         }
 
-        statusLabel.text = "🗑 \(models[index].label) 삭제됨"
         updateUI()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            let freed = self.systemFreeDiskBytes() - freeBefore
+            if freed > 0 {
+                let freedStr = ByteCountFormatter.string(fromByteCount: freed, countStyle: .file)
+                self.statusLabel.text = "🗑 \(self.models[index].label) 삭제됨 · \(freedStr) 확보"
+            } else {
+                self.statusLabel.text = "🗑 \(self.models[index].label) 삭제됨 (공간 변화 없음 — OS 캐시 지연일 수 있음)"
+            }
+        }
     }
 
     // MARK: - Article Extraction
@@ -712,14 +1175,22 @@ class ViewController: UIViewController {
     }
 
     private func generate(prompt: String) {
-        guard let container = modelContainer else { return }
-        let maxTokens = models[selectedIndex].maxTokens
+        guard let container = modelContainer, let loadedIdx = loadedModelIndex else { return }
+        if selectedIndex != loadedIdx {
+            selectedIndex = loadedIdx
+            modelPickerView.selectRow(loadedIdx, inComponent: 0, animated: false)
+            updateUI()
+        }
+        let maxTokens = models[loadedIdx].maxTokens
 
         generateTask?.cancel()
         accumulatedText = ""
+        isGenerating = true
         sendButton.isEnabled = false
         outputTextView.attributedText = nil
         outputTextView.text = ""
+        outputTextView.textColor = .label
+        updateUI()
 
         generateTask = Task {
             do {
@@ -728,11 +1199,21 @@ class ViewController: UIViewController {
                     chat: [.system(systemPrompt), .user(prompt)],
                     additionalContext: additionalContext
                 )
+
+                let modelName = self.models[loadedIdx].label
+                self.statusLabel.text = "⏳ \(modelName) · 입력 토큰화 중..."
+
                 let lmInput = try await container.prepare(input: userInput)
+                if Task.isCancelled { return }
+
+                self.statusLabel.text = "🤔 \(modelName) · 첫 토큰 생성 중... (대형 모델은 수 초 소요)"
+
                 let stream = try await container.generate(
                     input: lmInput,
                     parameters: GenerateParameters(maxTokens: maxTokens, temperature: 0.7)
                 )
+
+                self.statusLabel.text = "✍️ \(modelName) · 생성 중..."
 
                 for await event in stream {
                     if Task.isCancelled { break }
@@ -753,11 +1234,19 @@ class ViewController: UIViewController {
                     }
                 }
             } catch {
-                self.outputTextView.text = "오류: \(error.localizedDescription)"
-                self.outputTextView.textColor = .systemRed
+                let desc = error.localizedDescription
+                if desc.lowercased().contains("timeout") {
+                    let stage = self.statusLabel.text?.contains("토큰화") == true ? "입력 처리" : "첫 토큰 생성"
+                    self.showTimeoutAlert(retryPrompt: prompt, stage: stage)
+                } else {
+                    self.outputTextView.text = "오류: \(desc)"
+                    self.outputTextView.textColor = .systemRed
+                }
             }
 
+            self.isGenerating = false
             self.sendButton.isEnabled = self.modelContainer != nil
+            self.updateUI()
             self.inputField.text = ""
         }
     }
@@ -773,14 +1262,16 @@ extension ViewController: UIPickerViewDataSource, UIPickerViewDelegate {
         models.count
     }
 
-    func pickerView(_ pickerView: UIPickerView, rowHeightForComponent component: Int) -> CGFloat { 44 }
+    func pickerView(_ pickerView: UIPickerView, rowHeightForComponent component: Int) -> CGFloat { 56 }
 
     func pickerView(_ pickerView: UIPickerView, viewForRow row: Int, forComponent component: Int, reusing view: UIView?) -> UIView {
         let label = (view as? UILabel) ?? UILabel()
         label.textAlignment = .center
+        label.numberOfLines = 2
 
-        let info = models[row]
-        let icon = modelIcon(for: row)
+        let info   = models[row]
+        let icon   = modelIcon(for: row)
+        let compat = memoryCompatibility(for: row)
 
         var statusText: String
         if loadedModelIndex == row        { statusText = "로드됨" }
@@ -789,15 +1280,22 @@ extension ViewController: UIPickerViewDataSource, UIPickerViewDelegate {
         else if isDownloaded(info.config) { statusText = "다운로드됨" }
         else                              { statusText = "미다운로드" }
 
-        let text = NSMutableAttributedString()
-        text.append(NSAttributedString(
-            string: "\(icon)  \(info.label)",
+        // Line 1: icon + model name
+        let text = NSMutableAttributedString(
+            string: "\(icon)  \(info.label)\n",
             attributes: [.font: UIFont.systemFont(ofSize: 15, weight: .medium)]
+        )
+        // Line 2: size · status in secondary color, then compatibility badge in tier color
+        let line2 = NSMutableAttributedString(
+            string: "\(info.size)  ·  \(statusText)  · ",
+            attributes: [.font: UIFont.systemFont(ofSize: 12), .foregroundColor: UIColor.secondaryLabel]
+        )
+        line2.append(NSAttributedString(
+            string: " \(compat.badge) \(compat.label)",
+            attributes: [.font: UIFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: compat.color]
         ))
-        text.append(NSAttributedString(
-            string: "  ·  \(info.size)  ·  \(statusText)",
-            attributes: [.font: UIFont.systemFont(ofSize: 13), .foregroundColor: UIColor.secondaryLabel]
-        ))
+        text.append(line2)
+
         label.attributedText = text
         return label
     }
@@ -821,4 +1319,193 @@ extension ViewController: UITextFieldDelegate {
         textField.resignFirstResponder()
         return true
     }
+}
+
+// MARK: - Comparison Model Selection VC
+
+private final class ComparisonModelSelectionVC: UITableViewController {
+    private let modelLabels: [String]
+    private let downloadedIndices: [Int]
+    private var selectedSet: Set<Int> = []
+    private let completion: ([Int]) -> Void
+
+    init(modelLabels: [String], downloadedIndices: [Int], completion: @escaping ([Int]) -> Void) {
+        self.modelLabels = modelLabels
+        self.downloadedIndices = downloadedIndices
+        self.completion = completion
+        super.init(style: .insetGrouped)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "비교할 모델 선택 (2개 이상)"
+        navigationItem.leftBarButtonItem = UIBarButtonItem(
+            title: "취소", style: .plain, target: self, action: #selector(cancelTapped))
+        navigationItem.rightBarButtonItem = UIBarButtonItem(
+            title: "비교 시작", style: .done, target: self, action: #selector(startTapped))
+        navigationItem.rightBarButtonItem?.isEnabled = false
+    }
+
+    override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        downloadedIndices.count
+    }
+
+    override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = UITableViewCell(style: .subtitle, reuseIdentifier: nil)
+        let idx = downloadedIndices[indexPath.row]
+        cell.textLabel?.text = modelLabels[idx]
+        cell.accessoryType = selectedSet.contains(idx) ? .checkmark : .none
+        return cell
+    }
+
+    override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: true)
+        let idx = downloadedIndices[indexPath.row]
+        if selectedSet.contains(idx) { selectedSet.remove(idx) } else { selectedSet.insert(idx) }
+        tableView.reloadRows(at: [indexPath], with: .none)
+        navigationItem.rightBarButtonItem?.isEnabled = selectedSet.count >= 2
+        title = selectedSet.count >= 2 ? "비교할 모델 선택 (\(selectedSet.count)개)" : "비교할 모델 선택 (2개 이상)"
+    }
+
+    @objc private func cancelTapped() { dismiss(animated: true) }
+
+    @objc private func startTapped() {
+        let ordered = downloadedIndices.filter { selectedSet.contains($0) }
+        dismiss(animated: true) { self.completion(ordered) }
+    }
+}
+
+// MARK: - Comparison Results VC
+
+private final class ComparisonResultsVC: UIViewController {
+    private let prompt: String
+    private let results: [(label: String, text: String, tps: Double)]
+    private let renderer: (String) -> NSAttributedString
+
+    init(prompt: String,
+         results: [(label: String, text: String, tps: Double)],
+         renderer: @escaping (String) -> NSAttributedString) {
+        self.prompt = prompt
+        self.results = results
+        self.renderer = renderer
+        super.init(nibName: nil, bundle: nil)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .systemBackground
+        title = "모델 비교 (\(results.count)개)"
+        navigationItem.rightBarButtonItem = UIBarButtonItem(
+            title: "닫기", style: .done, target: self, action: #selector(closeTapped))
+
+        let scrollView = UIScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(scrollView)
+
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.spacing = 16
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            stack.topAnchor.constraint(equalTo: scrollView.topAnchor, constant: 16),
+            stack.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: scrollView.trailingAnchor, constant: -16),
+            stack.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: -16),
+            stack.widthAnchor.constraint(equalTo: scrollView.widthAnchor, constant: -32),
+        ])
+
+        // 질문 카드
+        let promptCard = makeCard()
+        let promptLabel = UILabel()
+        promptLabel.text = "Q. \(prompt)"
+        promptLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+        promptLabel.textColor = .secondaryLabel
+        promptLabel.numberOfLines = 0
+        promptCard.addSubview(promptLabel)
+        promptLabel.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            promptLabel.topAnchor.constraint(equalTo: promptCard.topAnchor, constant: 12),
+            promptLabel.leadingAnchor.constraint(equalTo: promptCard.leadingAnchor, constant: 14),
+            promptLabel.trailingAnchor.constraint(equalTo: promptCard.trailingAnchor, constant: -14),
+            promptLabel.bottomAnchor.constraint(equalTo: promptCard.bottomAnchor, constant: -12),
+        ])
+        stack.addArrangedSubview(promptCard)
+
+        // 모델별 결과 카드
+        for result in results {
+            stack.addArrangedSubview(makeResultCard(result))
+        }
+    }
+
+    private func makeResultCard(_ result: (label: String, text: String, tps: Double)) -> UIView {
+        let card = makeCard()
+        let inner = UIStackView()
+        inner.axis = .vertical
+        inner.spacing = 8
+        inner.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(inner)
+        NSLayoutConstraint.activate([
+            inner.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
+            inner.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            inner.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            inner.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12),
+        ])
+
+        // 헤더: 모델명 + tok/s
+        let headerRow = UIStackView()
+        headerRow.axis = .horizontal
+        headerRow.spacing = 8
+
+        let nameLabel = UILabel()
+        nameLabel.text = result.label
+        nameLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        headerRow.addArrangedSubview(nameLabel)
+
+        if result.tps > 0 {
+            let tpsLabel = UILabel()
+            tpsLabel.text = String(format: "%.1f tok/s", result.tps)
+            tpsLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+            tpsLabel.textColor = .secondaryLabel
+            tpsLabel.setContentHuggingPriority(.required, for: .horizontal)
+            headerRow.addArrangedSubview(tpsLabel)
+        }
+        inner.addArrangedSubview(headerRow)
+
+        let sep = UIView()
+        sep.backgroundColor = .separator
+        sep.translatesAutoresizingMaskIntoConstraints = false
+        sep.heightAnchor.constraint(equalToConstant: 0.5).isActive = true
+        inner.addArrangedSubview(sep)
+
+        // 응답 텍스트 (마크다운 렌더링)
+        let textView = UITextView()
+        textView.isEditable = false
+        textView.isScrollEnabled = false
+        textView.font = .systemFont(ofSize: 14)
+        textView.backgroundColor = .clear
+        textView.textContainerInset = .zero
+        textView.textContainer.lineFragmentPadding = 0
+        textView.attributedText = renderer(result.text)
+        inner.addArrangedSubview(textView)
+
+        return card
+    }
+
+    private func makeCard() -> UIView {
+        let v = UIView()
+        v.backgroundColor = .secondarySystemBackground
+        v.layer.cornerRadius = 12
+        v.clipsToBounds = true
+        return v
+    }
+
+    @objc private func closeTapped() { dismiss(animated: true) }
 }
