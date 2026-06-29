@@ -77,6 +77,9 @@ class ViewController: UIViewController {
     private var isBusy: Bool { isGenerating || isComparing }
     private var accumulatedText = ""
     private var lastProgressUpdate = Date.distantPast
+    // 마지막으로 LLM에 전송한 실제 입력값 (입력 확인 기능용)
+    private var lastSentSystem = ""
+    private var lastSentUser   = ""
 
     private let systemPrompt = "당신은 친절한 AI 어시스턴트입니다. 모든 답변은 반드시 한국어로 작성해 주세요."
 
@@ -223,7 +226,7 @@ class ViewController: UIViewController {
 
     private lazy var inputField: UITextField = {
         let tf = UITextField()
-        tf.placeholder = "질문 또는 뉴스 URL을 입력하세요..."
+        tf.placeholder = "질문을 입력하세요..."
         tf.borderStyle = .roundedRect
         tf.returnKeyType = .send
         tf.delegate = self
@@ -273,6 +276,26 @@ class ViewController: UIViewController {
         let longPress = UILongPressGestureRecognizer(target: self, action: #selector(sendLongPressed(_:)))
         longPress.minimumPressDuration = 0.8
         sendButton.addGestureRecognizer(longPress)
+
+        // statusLabel 탭 → 마지막으로 LLM에 보낸 실제 입력값 확인
+        statusLabel.isUserInteractionEnabled = true
+        statusLabel.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(showLastInput)))
+    }
+
+    @objc private func showLastInput() {
+        guard !lastSentUser.isEmpty else { return }
+        showInputSheet(system: lastSentSystem, user: lastSentUser)
+    }
+
+    private func showInputSheet(system: String, user: String) {
+        let vc = LLMInputInspectorVC(system: system, user: user)
+        let nav = UINavigationController(rootViewController: vc)
+        nav.modalPresentationStyle = .pageSheet
+        if let sheet = nav.sheetPresentationController {
+            sheet.detents = [.medium(), .large()]
+            sheet.prefersGrabberVisible = true
+        }
+        present(nav, animated: true)
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -679,6 +702,19 @@ class ViewController: UIViewController {
         return bytes > 0 ? Double(bytes) / 1_073_741_824 : 0
     }
 
+    // Metal 버퍼가 OS에 실제로 반환될 때까지 폴링 대기
+    // 반환값: true = 충분한 메모리 확보, false = 15초 내 확보 실패 (중단 필요)
+    @discardableResult
+    private func waitForMemoryHeadroom(needed neededGB: Double = 2.0) async -> Bool {
+        let deadline = Date().addingTimeInterval(15)
+        while Date() < deadline {
+            let availGB = Double(os_proc_available_memory()) / 1_073_741_824
+            if availGB >= neededGB { return true }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        return false  // 시간 내 메모리 확보 실패
+    }
+
     private func startStatsTimer() {
         UIDevice.current.isBatteryMonitoringEnabled = true
         updateStats()
@@ -869,7 +905,7 @@ class ViewController: UIViewController {
 
     @objc private func sendLongPressed(_ gesture: UILongPressGestureRecognizer) {
         guard gesture.state == .began, !isComparing else { return }
-        guard let prompt = inputField.text?.trimmingCharacters(in: .whitespacesAndNewlines), !prompt.isEmpty else {
+        guard let text = inputField.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
             showToast("먼저 질문을 입력하세요")
             return
         }
@@ -884,7 +920,7 @@ class ViewController: UIViewController {
             modelLabels: models.map { $0.label },
             downloadedIndices: downloadedIndices
         ) { [weak self] selectedIndices in
-            self?.startComparison(prompt: prompt, modelIndices: selectedIndices)
+            self?.startComparison(prompt: text, modelIndices: selectedIndices)
         }
         let nav = UINavigationController(rootViewController: selectionVC)
         nav.modalPresentationStyle = .pageSheet
@@ -897,7 +933,9 @@ class ViewController: UIViewController {
 
     private func startComparison(prompt: String, modelIndices: [Int]) {
         let physGB  = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
-        let limitGB = physGB * 0.40
+        // 비교 모드는 모델을 순차 로드하므로 단일 로드(0.40)보다 보수적인 한도 적용
+        // 토크나이저 파싱 피크 메모리까지 고려해 0.30으로 제한
+        let limitGB = physGB * 0.30
         let loadableIndices = modelIndices.filter { estimatedRAMGB(for: $0) <= limitGB }
 
         guard !loadableIndices.isEmpty else {
@@ -914,6 +952,7 @@ class ViewController: UIViewController {
         generateTask = nil
         modelContainer = nil
         loadedModelIndex = nil
+        Memory.clearCache()  // 이전 모델의 Metal 버퍼를 즉시 캐시에서 제거
 
         isComparing = true
         sendButton.isEnabled = false
@@ -924,6 +963,16 @@ class ViewController: UIViewController {
         var results: [(label: String, text: String, tps: Double)] = []
 
         compareTask = Task {
+            // 첫 모델 로드 전: 이전 모델 Metal 버퍼가 OS에 반환될 때까지 대기
+            // 실패(15초 내 2GB 미확보)시 비교 자체를 중단
+            guard await waitForMemoryHeadroom() else {
+                self.isComparing = false
+                self.inputField.isEnabled = true
+                self.updateUI()
+                self.statusLabel.text = "❌ 메모리 부족으로 비교를 시작할 수 없습니다. 기존 모델을 언로드 후 시도하세요."
+                return
+            }
+
             for (i, idx) in loadableIndices.enumerated() {
                 if Task.isCancelled { break }
                 let label = models[idx].label
@@ -964,12 +1013,18 @@ class ViewController: UIViewController {
                         }
                     }
                     results.append((label: label, text: text, tps: tps))
-                    container = nil          // Swift 참조 해제
-                    Memory.clearCache()      // MLX Metal 버퍼 캐시를 OS에 반환
-
+                    // container, c, stream 모두 do 블록 종료 시 해제됨
                 } catch {
                     results.append((label: label, text: "오류: \(error.localizedDescription)", tps: 0))
-                    Memory.clearCache()
+                }
+                // do-catch 블록이 끝난 뒤 — c, stream 참조 소멸 후 캐시 클리어
+                Memory.clearCache()
+                // 다음 모델 전 메모리 확보 대기, 실패 시 남은 결과로 비교 완료
+                if i < loadableIndices.count - 1 {
+                    guard await waitForMemoryHeadroom() else {
+                        self.statusLabel.text = "⚠️ 메모리 부족으로 \(i + 1)/\(total)개 모델까지만 비교됩니다."
+                        break
+                    }
                 }
             }
 
@@ -987,7 +1042,12 @@ class ViewController: UIViewController {
             let renderer: (String) -> NSAttributedString = { [weak self] text in
                 self?.renderOutput(text) ?? NSAttributedString(string: text)
             }
-            let vc = ComparisonResultsVC(prompt: prompt, results: results, renderer: renderer)
+            let vc = ComparisonResultsVC(
+                prompt: prompt,
+                systemPrompt: self.systemPrompt,
+                results: results,
+                renderer: renderer
+            )
             let nav = UINavigationController(rootViewController: vc)
             nav.modalPresentationStyle = .fullScreen
             self.present(nav, animated: true)
@@ -1087,32 +1147,6 @@ class ViewController: UIViewController {
         }
     }
 
-    // MARK: - Article Extraction
-
-    private func extractAndSummarize(urlString: String) {
-        guard modelContainer != nil else {
-            statusLabel.text = "❌ 먼저 모델을 로드해주세요."
-            return
-        }
-        generateTask?.cancel()
-        sendButton.isEnabled = false
-        accumulatedText = ""
-        outputTextView.text = ""
-        statusLabel.text = "🔍 기사 본문 추출 중..."
-
-        Task {
-            do {
-                let article = try await ArticleExtractor.extract(from: urlString)
-                let info = "📰 \(article.title)" + (article.author.map { "  ·  \($0)" } ?? "")
-                self.statusLabel.text = info
-                self.generate(prompt: article.summaryPrompt)
-            } catch {
-                self.statusLabel.text = "❌ \(error.localizedDescription)"
-                self.sendButton.isEnabled = true
-            }
-        }
-    }
-
     // MARK: - Markdown Rendering
 
     private func renderOutput(_ text: String) -> NSAttributedString {
@@ -1167,11 +1201,7 @@ class ViewController: UIViewController {
     @objc private func sendTapped() {
         guard let text = inputField.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return }
         inputField.resignFirstResponder()
-        if text.lowercased().hasPrefix("http://") || text.lowercased().hasPrefix("https://") {
-            extractAndSummarize(urlString: text)
-        } else {
-            generate(prompt: text)
-        }
+        generate(prompt: text)
     }
 
     private func generate(prompt: String) {
@@ -1194,6 +1224,8 @@ class ViewController: UIViewController {
 
         generateTask = Task {
             do {
+                self.lastSentSystem = systemPrompt
+                self.lastSentUser   = prompt
                 let additionalContext: [String: any Sendable]? = isThinkingEnabled ? nil : ["enable_thinking": false]
                 let userInput = UserInput(
                     chat: [.system(systemPrompt), .user(prompt)],
@@ -1380,13 +1412,16 @@ private final class ComparisonModelSelectionVC: UITableViewController {
 
 private final class ComparisonResultsVC: UIViewController {
     private let prompt: String
+    private let systemPromptText: String
     private let results: [(label: String, text: String, tps: Double)]
     private let renderer: (String) -> NSAttributedString
 
     init(prompt: String,
+         systemPrompt: String,
          results: [(label: String, text: String, tps: Double)],
          renderer: @escaping (String) -> NSAttributedString) {
-        self.prompt = prompt
+        self.prompt           = prompt
+        self.systemPromptText = systemPrompt
         self.results = results
         self.renderer = renderer
         super.init(nibName: nil, bundle: nil)
@@ -1422,21 +1457,32 @@ private final class ComparisonResultsVC: UIViewController {
             stack.widthAnchor.constraint(equalTo: scrollView.widthAnchor, constant: -32),
         ])
 
-        // 질문 카드
+        // 질문 카드 (탭하면 실제 LLM 입력 확인)
         let promptCard = makeCard()
+        let cardStack = UIStackView()
+        cardStack.axis = .vertical
+        cardStack.spacing = 6
+        cardStack.translatesAutoresizingMaskIntoConstraints = false
+        promptCard.addSubview(cardStack)
+        NSLayoutConstraint.activate([
+            cardStack.topAnchor.constraint(equalTo: promptCard.topAnchor, constant: 12),
+            cardStack.leadingAnchor.constraint(equalTo: promptCard.leadingAnchor, constant: 14),
+            cardStack.trailingAnchor.constraint(equalTo: promptCard.trailingAnchor, constant: -14),
+            cardStack.bottomAnchor.constraint(equalTo: promptCard.bottomAnchor, constant: -12),
+        ])
         let promptLabel = UILabel()
         promptLabel.text = "Q. \(prompt)"
         promptLabel.font = .systemFont(ofSize: 14, weight: .semibold)
         promptLabel.textColor = .secondaryLabel
         promptLabel.numberOfLines = 0
-        promptCard.addSubview(promptLabel)
-        promptLabel.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            promptLabel.topAnchor.constraint(equalTo: promptCard.topAnchor, constant: 12),
-            promptLabel.leadingAnchor.constraint(equalTo: promptCard.leadingAnchor, constant: 14),
-            promptLabel.trailingAnchor.constraint(equalTo: promptCard.trailingAnchor, constant: -14),
-            promptLabel.bottomAnchor.constraint(equalTo: promptCard.bottomAnchor, constant: -12),
-        ])
+        cardStack.addArrangedSubview(promptLabel)
+        let hintLabel = UILabel()
+        hintLabel.text = "탭하여 실제 LLM 입력 확인 ↗"
+        hintLabel.font = .systemFont(ofSize: 11)
+        hintLabel.textColor = .tertiaryLabel
+        cardStack.addArrangedSubview(hintLabel)
+        promptCard.isUserInteractionEnabled = true
+        promptCard.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(showInput)))
         stack.addArrangedSubview(promptCard)
 
         // 모델별 결과 카드
@@ -1505,6 +1551,98 @@ private final class ComparisonResultsVC: UIViewController {
         v.layer.cornerRadius = 12
         v.clipsToBounds = true
         return v
+    }
+
+    @objc private func closeTapped() { dismiss(animated: true) }
+
+    @objc private func showInput() {
+        let vc = LLMInputInspectorVC(system: systemPromptText, user: prompt)
+        let nav = UINavigationController(rootViewController: vc)
+        nav.modalPresentationStyle = .pageSheet
+        if let sheet = nav.sheetPresentationController {
+            sheet.detents = [.medium(), .large()]
+            sheet.prefersGrabberVisible = true
+        }
+        present(nav, animated: true)
+    }
+}
+
+// MARK: - LLM Input Inspector
+
+private final class LLMInputInspectorVC: UIViewController {
+    private let systemText: String
+    private let userText: String
+
+    init(system: String, user: String) {
+        self.systemText = system
+        self.userText   = user
+        super.init(nibName: nil, bundle: nil)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "실제 LLM 입력"
+        view.backgroundColor = .systemBackground
+        navigationItem.rightBarButtonItem = UIBarButtonItem(
+            title: "닫기", style: .done, target: self, action: #selector(closeTapped))
+
+        let scroll = UIScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            scroll.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+        ])
+
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.spacing = 20
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        scroll.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: scroll.topAnchor, constant: 16),
+            stack.leadingAnchor.constraint(equalTo: scroll.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: scroll.trailingAnchor, constant: -16),
+            stack.bottomAnchor.constraint(equalTo: scroll.bottomAnchor, constant: -16),
+            stack.widthAnchor.constraint(equalTo: scroll.widthAnchor, constant: -32),
+        ])
+
+        stack.addArrangedSubview(makeSection(title: "SYSTEM", body: systemText, color: .systemBlue))
+        stack.addArrangedSubview(makeSection(title: "USER", body: userText, color: .systemGreen))
+    }
+
+    private func makeSection(title: String, body: String, color: UIColor) -> UIView {
+        let container = UIView()
+        container.backgroundColor = color.withAlphaComponent(0.07)
+        container.layer.cornerRadius = 10
+        container.clipsToBounds = true
+
+        let badge = UILabel()
+        badge.text = title
+        badge.font = .monospacedSystemFont(ofSize: 11, weight: .bold)
+        badge.textColor = color
+
+        let bodyLabel = UILabel()
+        bodyLabel.text = body
+        bodyLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        bodyLabel.textColor = .label
+        bodyLabel.numberOfLines = 0
+
+        let inner = UIStackView(arrangedSubviews: [badge, bodyLabel])
+        inner.axis = .vertical
+        inner.spacing = 6
+        inner.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(inner)
+        NSLayoutConstraint.activate([
+            inner.topAnchor.constraint(equalTo: container.topAnchor, constant: 12),
+            inner.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
+            inner.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
+            inner.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
+        ])
+        return container
     }
 
     @objc private func closeTapped() { dismiss(animated: true) }
